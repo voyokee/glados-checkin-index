@@ -1,0 +1,20 @@
+name: GLaDOS Checkin
+
+on:
+  schedule:
+    - cron: "17 1 * * *" # 北京时间 09:17
+  workflow_dispatch:
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check in
+        env:
+          GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
+          GLADOS_HOST: glados.rocks
+        run: python checkin.py

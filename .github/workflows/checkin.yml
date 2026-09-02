@@ -2,7 +2,9 @@ name: GLaDOS Checkin
 
 on:
   schedule:
-    - cron: "17 1 * * *" # 北京时间 09:17
+    # 北京时间 14:00–19:30 每 30 分钟 + 20:00 兜底（UTC = 北京时间 - 8）
+    - cron: "0,30 6-11 * * *"
+    - cron: "0 12 * * *"
   workflow_dispatch:
 
 jobs:
@@ -16,5 +18,4 @@ jobs:
       - name: Check in
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
-          GLADOS_HOST: glados.rocks
         run: python checkin.py

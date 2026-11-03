@@ -9,31 +9,28 @@ $action = New-ScheduledTaskAction `
     -WorkingDirectory $dir
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
-# 14:00–19:30 每 30 分钟轮询 IQI；20:00 无条件兜底
-$triggerPoll = New-ScheduledTaskTrigger -Daily -At 14:00
-$triggerPoll.Repetition.Interval = "PT30M"
-$triggerPoll.Repetition.Duration = "PT5H30M"
-$triggerPoll.Repetition.StopAtDurationEnd = $false
-
-$triggerForce = New-ScheduledTaskTrigger -Daily -At 20:00
+# 四档：16:00 <80 | 17:00 <85 | 18:00 <90 | 19:00 anyscore
+$times = @("16:00", "17:00", "18:00", "19:00")
+$triggers = $times | ForEach-Object { New-ScheduledTaskTrigger -Daily -At $_ }
 
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
-    -MultipleInstances IgnoreNew
+    -MultipleInstances IgnoreNew `
+    -WakeToRun
 
 Register-ScheduledTask `
     -TaskName $taskName `
     -Action $action `
-    -Trigger @($triggerPoll, $triggerForce) `
+    -Trigger $triggers `
     -Settings $settings `
     -Principal $principal `
-    -Description "GLaDOS IQI check-in (14:00-20:00, glados.rocks)" `
+    -Description "GLaDOS 4-tier IQI check-in" `
     -Force | Out-Null
 
-Write-Host "Registered scheduled task $taskName."
-Write-Host "  Poll: daily 14:00-19:30 every 30 min"
-Write-Host "  Force: daily 20:00"
+Write-Host "Registered scheduled task $taskName with $($times.Count) daily triggers."
+Write-Host "  16:00 Index<80 | 17:00 Index<85 | 18:00 Index<90 | 19:00 anyscore"
+Write-Host "  Wake: enabled"
 Write-Host "Run now: Start-ScheduledTask -TaskName $taskName"
 Write-Host "Log file: $dir\checkin.log"

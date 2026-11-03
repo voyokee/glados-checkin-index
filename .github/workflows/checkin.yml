@@ -2,9 +2,8 @@ name: GLaDOS Checkin
 
 on:
   schedule:
-    # 北京时间 14:00–19:30 每 30 分钟 + 20:00 兜底（UTC = 北京时间 - 8）
-    - cron: "0,30 6-11 * * *"
-    - cron: "0 12 * * *"
+    # 北京时间 16:00 / 17:00 / 18:00 / 19:00
+    - cron: "0 8,9,10,11 * * *"
   workflow_dispatch:
 
 jobs:

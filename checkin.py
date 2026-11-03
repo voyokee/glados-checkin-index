@@ -29,18 +29,30 @@ UA = (
 CHECKIN_OK = {0, 1}
 DOMAINS = ("glados.cloud", "glados.rocks", "glados.network")
 
-# (北京时间整点起, 严格小于该值才签到)
-IQI_THRESHOLDS = (
-    (14, 75),
-    (16, 85),
-    (18, 95),
+# 每天 4 档（对应计划任务 16/17/18/19 点），Index 严格小于该值才签；最后一档 anyscore
+CHECKIN_SCHEDULE = (
+    (16, 80),
+    (17, 85),
+    (18, 90),
+    (19, None),
 )
-WINDOW_START_MINUTES = 14 * 60
-FORCE_CHECKIN_MINUTES = 20 * 60  # 20:00 起无条件兜底
-WINDOW_END_MINUTES = 22 * 60
+WINDOW_START_MINUTES = 16 * 60
+WINDOW_END_MINUTES = 19 * 60 + 59
 
-ForceCheckin = Literal["FORCE"]
-ThresholdResult = int | ForceCheckin | None
+AnyScore = Literal["ANY"]
+ThresholdResult = int | AnyScore | None
+
+
+def schedule_label(threshold: ThresholdResult) -> str:
+    if threshold == "ANY":
+        return "19:00 anyscore"
+    if threshold == 80:
+        return "16:00 Index<80 (+8档)"
+    if threshold == 85:
+        return "17:00 Index<85"
+    if threshold == 90:
+        return "18:00 Index<90"
+    return str(threshold)
 
 
 def log(msg: str) -> None:
@@ -81,18 +93,16 @@ def minutes_of_day(now: datetime) -> int:
 
 
 def get_iqi_threshold(now: datetime) -> ThresholdResult:
-    """返回当前北京时间对应的 IQI 阈值、FORCE（20:00 兜底）或 None（窗口外）。"""
+    """按当前北京时间所在档位返回 Index 上界或 ANY（19:00 任意 Index 签到）。"""
     minutes = minutes_of_day(now)
     if minutes < WINDOW_START_MINUTES or minutes > WINDOW_END_MINUTES:
         return None
-    if minutes >= FORCE_CHECKIN_MINUTES:
-        return "FORCE"
-    threshold: int | None = None
     hour = now.astimezone(TZ_CST).hour
-    for start_hour, value in IQI_THRESHOLDS:
+    result: ThresholdResult = None
+    for start_hour, bound in CHECKIN_SCHEDULE:
         if hour >= start_hour:
-            threshold = value
-    return threshold
+            result = "ANY" if bound is None else bound
+    return result
 
 
 def detect_proxy() -> str | None:
@@ -281,13 +291,13 @@ def do_checkin(opener: urllib.request.OpenerDirector, ck: str) -> int:
             )
 
             try:
-                _, st = api_with_domains(opener, "GET", "/api/user/status", ck)
+                _, _, st = api_with_domains(opener, "GET", "/api/user/status", ck)
                 log(f"status {summarize_status(st)}")
             except Exception as e:
                 log(f"查询 status 失败: {e}")
 
             try:
-                _, pts = api_with_domains(opener, "GET", "/api/user/points", ck)
+                _, _, pts = api_with_domains(opener, "GET", "/api/user/points", ck)
                 total = pts.get("points")
                 if total is not None:
                     log(f"积分 {int(float(total))}")
@@ -314,8 +324,10 @@ def main() -> int:
 
     threshold = get_iqi_threshold(now)
     if threshold is None:
-        log("不在 14:00–22:00 签到窗口，退出")
+        log("不在 16:00–19:59 签到窗口，退出")
         return 0
+
+    log(f"当前档位: {schedule_label(threshold)}")
 
     try:
         _, _, points_payload = api_with_domains(opener, "GET", "/api/user/points", ck)
@@ -325,10 +337,6 @@ def main() -> int:
     except Exception as e:
         log(f"查询今日签到状态失败: {e}")
         return 2
-
-    if threshold == "FORCE":
-        log("到达 20:00 兜底时间，无条件签到")
-        return do_checkin(opener, ck)
 
     try:
         host, iqi = get_iqi(opener, ck)
@@ -341,27 +349,31 @@ def main() -> int:
         log(f"IQI 查询失败: {e}，等待下次运行")
         return 0
 
+    if threshold == "ANY":
+        log(f"Index {score:g}，{schedule_label(threshold)}，执行签到")
+        return do_checkin(opener, ck)
+
     if score >= threshold:
-        log(f"Index {score:g} >= 阈值 {threshold}（严格小于才签），继续等待")
+        log(
+            f"Index {score:g} >= {threshold}（严格小于才签），"
+            f"本次不签，等下一档计划任务"
+        )
         return 0
 
-    log(f"Index {score:g} < 阈值 {threshold}，执行签到")
+    log(f"Index {score:g} < {threshold}（{schedule_label(threshold)}），执行签到")
     return do_checkin(opener, ck)
 
 
 def _test_thresholds() -> None:
     cases = [
-        ("13:59", None),
-        ("14:00", 75),
-        ("15:59", 75),
-        ("16:00", 85),
-        ("17:59", 85),
-        ("18:00", 95),
-        ("19:59", 95),
-        ("20:00", "FORCE"),
-        ("21:30", "FORCE"),
-        ("22:00", "FORCE"),
-        ("22:01", None),
+        ("15:59", None),
+        ("16:00", 80),
+        ("16:59", 80),
+        ("17:00", 85),
+        ("18:00", 90),
+        ("19:00", "ANY"),
+        ("19:30", "ANY"),
+        ("20:00", None),
     ]
     for hm, expected in cases:
         h, m = map(int, hm.split(":"))

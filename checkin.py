@@ -669,6 +669,45 @@ def verify_points(
         pass
 
 
+def emit_day_lock(acquired: bool) -> None:
+    """打印给 GitHub Actions 的当日成功锁。acquired 只表示今天不用再签。"""
+    print(f"GLADOS_DAY_LOCK={'acquired' if acquired else 'open'}", flush=True)
+
+
+def lock_dir() -> Path:
+    override = os.environ.get("GLADOS_LOCK_DIR", "").strip()
+    return Path(override) if override else ROOT / ".glados-checkin-lock"
+
+
+def day_key(now: datetime) -> str:
+    return now.astimezone(TZ_CST).strftime("%Y-%m-%d")
+
+
+def local_lock_path(now: datetime) -> Path:
+    return lock_dir() / f"glados-checkin-success-{day_key(now)}"
+
+
+def local_day_locked(now: datetime) -> bool:
+    return local_lock_path(now).is_file()
+
+
+def write_local_day_lock(now: datetime) -> None:
+    path = local_lock_path(now)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"glados-checkin-success-{day_key(now)}\n", encoding="utf-8")
+
+
+def force_requested() -> bool:
+    return os.environ.get("GLADOS_FORCE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def finish(code: int, *, lock: bool, now: datetime | None = None) -> int:
+    if lock and now is not None:
+        write_local_day_lock(now)
+    emit_day_lock(lock)
+    return code
+
+
 def do_checkin(
     opener: urllib.request.OpenerDirector,
     cookie_header: str,
@@ -722,12 +761,15 @@ def do_checkin(
 def run(now: datetime | None = None) -> int:
     load_dotenv()
     now = now or beijing_now()
+    if local_day_locked(now) and not force_requested():
+        log(f"今日 {day_key(now)} 已有本地成功标记，跳过 GLaDOS API")
+        return finish(0, lock=True, now=now)
     try:
         ck, kind = load_cookie()
         user_agent = resolve_user_agent()
     except ConfigError as e:
         log(str(e))
-        return 2
+        return finish(2, lock=False, now=now)
 
     proxy = detect_proxy()
     opener = make_opener(proxy)
@@ -738,7 +780,7 @@ def run(now: datetime | None = None) -> int:
     threshold = get_iqi_threshold(now)
     if threshold is None:
         log("不在 16:00–19:59 签到窗口，退出")
-        return 0
+        return finish(0, lock=False, now=now)
 
     log(f"当前档位: {schedule_label(threshold)}")
 
@@ -750,7 +792,7 @@ def run(now: datetime | None = None) -> int:
     except ApiError as e:
         if not e.retryable:
             log(f"查询今日签到状态被拒绝，停止 reason={e.reason}")
-            return 1
+            return finish(1, lock=False, now=now)
         points_payload = None
     except Exception:
         points_payload = None
@@ -758,10 +800,10 @@ def run(now: datetime | None = None) -> int:
     if points_payload is not None and already_checked_in_today(points_payload, now):
         log_reward(today_positive_change(points_payload, now), None, already=True)
         log("今日已签到，退出")
-        return 0
+        return finish(0, lock=True, now=now)
     if points_payload is None and threshold != "ANY":
         log("查询今日签到状态失败")
-        return 2
+        return finish(2, lock=False, now=now)
     if points_payload is None:
         log("查询今日签到状态失败，19:00 anyscore 仍尝试兜底签到")
 
@@ -776,15 +818,15 @@ def run(now: datetime | None = None) -> int:
     except ApiError as e:
         if not e.retryable:
             log(f"IQI 认证失败，停止 reason={e.reason}")
-            return 1
+            return finish(1, lock=False, now=now)
         if threshold != "ANY":
             log("IQI 查询失败，等待下一档")
-            return 0
+            return finish(0, lock=False, now=now)
         log("IQI 查询失败，19:00 anyscore 仍执行兜底签到")
     except Exception:
         if threshold != "ANY":
             log("IQI 查询失败，等待下一档")
-            return 0
+            return finish(0, lock=False, now=now)
         log("IQI 查询失败，19:00 anyscore 仍执行兜底签到")
 
     if threshold != "ANY":
@@ -794,13 +836,14 @@ def run(now: datetime | None = None) -> int:
                 f"Index {score:g} >= {threshold}（严格小于才签），"
                 f"本次不签，等下一档计划任务"
             )
-            return 0
+            return finish(0, lock=False, now=now)
         log(f"Index {score:g} < {threshold}（{schedule_label(threshold)}），执行签到")
     elif score is None:
         log(f"{schedule_label(threshold)}，IQI 不可用，执行兜底签到")
     else:
         log(f"Index {score:g}，{schedule_label(threshold)}，执行签到")
-    return do_checkin(opener, ck, user_agent, now)
+    code = do_checkin(opener, ck, user_agent, now)
+    return finish(code, lock=code == 0, now=now)
 
 
 def _test_thresholds() -> None:
@@ -827,11 +870,14 @@ def main() -> int:
         return run()
     except Exception:
         log("异常: 未预期错误")
+        emit_day_lock(False)
         return 2
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--test-threshold":
+    if "--test-threshold" in sys.argv:
         _test_thresholds()
         raise SystemExit(0)
+    if "--force" in sys.argv:
+        os.environ["GLADOS_FORCE"] = "1"
     raise SystemExit(main())

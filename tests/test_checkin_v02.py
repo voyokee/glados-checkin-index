@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timezone, timedelta
 from unittest import mock
 
@@ -262,6 +263,8 @@ class FlowTests(unittest.TestCase):
             "HTTPS_PROXY": "",
             "https_proxy": "",
             "GLADOS_HOST": "",
+            "GLADOS_LOCK_DIR": os.path.join(self.tmp.name, "lock"),
+            "GLADOS_FORCE": "",
         }
         self._patches = [
             mock.patch("checkin.time.sleep", self.clock.sleep),
@@ -360,6 +363,45 @@ class FlowTests(unittest.TestCase):
         self.assertNotIn("奖励已恢复", self.log_text())
         self.assertNotIn("积分已恢复", self.log_text())
 
+    def lock_line(self, now: datetime) -> str:
+        with redirect_stdout(io.StringIO()) as buf:
+            checkin.run(now)
+        lines = [line for line in buf.getvalue().splitlines() if line.startswith("GLADOS_DAY_LOCK=")]
+        self.assertEqual(len(lines), 1)
+        return lines[0]
+
+    def test_day_lock_stays_open_when_index_misses(self) -> None:
+        self.iqi_score = 80
+        self.assertEqual(self.lock_line(at(16)), "GLADOS_DAY_LOCK=open")
+        self.assertEqual(self.posts(), [])
+
+    def test_day_lock_acquired_after_success_or_existing_history(self) -> None:
+        self.after_checkin = 9
+        self.assertEqual(self.lock_line(at(16)), "GLADOS_DAY_LOCK=acquired")
+        self.calls.clear()
+        self.points_change = 9
+        self.after_checkin = None
+        self.assertEqual(self.lock_line(at(17)), "GLADOS_DAY_LOCK=acquired")
+        self.assertEqual(self.posts(), [])
+
+    def test_local_lock_skips_later_slots_and_resets_next_day(self) -> None:
+        self.after_checkin = 9
+        self.assertEqual(checkin.run(at(16)), 0)
+        self.assertTrue(checkin.local_day_locked(at(17)))
+        self.calls.clear()
+        self.assertEqual(checkin.run(at(17)), 0)
+        self.assertEqual(self.calls, [])
+        self.assertIn("跳过 GLaDOS API", self.log_text())
+        os.environ["GLADOS_FORCE"] = "1"
+        self.assertEqual(checkin.run(at(18)), 0)
+        self.assertTrue(self.calls)
+        os.environ["GLADOS_FORCE"] = ""
+        self.calls.clear()
+        next_day = at(16).replace(day=10)
+        self.assertFalse(checkin.local_day_locked(next_day))
+        self.assertEqual(checkin.run(next_day), 0)
+        self.assertTrue(self.calls)
+
     def test_already_checked_in_does_not_post(self) -> None:
         self.points_change = 9
         self.assertEqual(checkin.run(at(19)), 0)
@@ -452,7 +494,12 @@ class CompatibilityTests(unittest.TestCase):
     def test_missing_cookie_stops_before_network(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
             os.environ,
-            {"GLADOS_COOKIE": "", "GLADOS_LOG_PATH": os.path.join(tmp, "checkin.log")},
+            {
+                "GLADOS_COOKIE": "",
+                "GLADOS_LOG_PATH": os.path.join(tmp, "checkin.log"),
+                "GLADOS_LOCK_DIR": os.path.join(tmp, "lock"),
+                "GLADOS_FORCE": "",
+            },
             clear=False,
         ), mock.patch("checkin.load_dotenv"), mock.patch("checkin.api") as api:
             self.assertEqual(checkin.run(at(16)), 2)

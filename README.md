@@ -172,6 +172,8 @@ powershell -ExecutionPolicy Bypass -File .\install-task.ps1
 
 默认定时仍是 **16:00 / 17:00 / 18:00 / 19:00** 四档；已开启 **唤醒计算机以运行此任务**。v0.2 不改这四个时间。日志见 `checkin.log`。
 
+某一档签到成功，或 Points History 确认今天已经签过，脚本会在本目录写下 `.glados-checkin-lock/glados-checkin-success-当天日期`。同一天后面的计划任务仍会启动，但在读取 Cookie 和请求 GLaDOS 之前就退出。Index 不达标不写这个文件。第二天文件名对不上，四档自动恢复。要忽略标记再跑一次：`py -3 checkin.py --force`。
+
 注意：仅对**睡眠**有效，关机/休眠后无法唤醒；部分笔记本需在 BIOS 或电源选项里允许「定时器唤醒」。
 
 卸载：
@@ -186,7 +188,9 @@ Unregister-ScheduledTask -TaskName GLaDOS-Checkin -Confirm:$false
 
 `Settings → Secrets and variables → Actions`
 
-不要把 `.env` 或 `checkin.log` 推上去。Workflow 与本地一致，cron 仍是北京时间 **16:00 / 17:00 / 18:00 / 19:00**。可选 User-Agent 放在 Actions Variables 或 Secrets 的 `GLADOS_USER_AGENT`。GitHub 可能延迟，本机计划任务更稳。
+不要把 `.env` 或 `checkin.log` 推上去。cron 仍是北京时间 **16:00 / 17:00 / 18:00 / 19:00**。某一档签到成功，或 Points History 确认今天已经签过，Actions 会按北京时间写入当日成功标记；同一天后面的定时任务仍会留下一条运行记录，但不再启动 Python，也不再请求 GLaDOS。Index 不达标不会写标记，下一档继续。第二天日期变化后标记自动失效。
+
+手动运行时可勾选 `force`，忽略当日标记再核验一次。可选 User-Agent 放在 Actions Variables 或 Secrets 的 `GLADOS_USER_AGENT`。GitHub 可能延迟，本机计划任务更稳。
 
 ---
 

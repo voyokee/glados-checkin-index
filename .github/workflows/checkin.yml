@@ -2,20 +2,67 @@ name: GLaDOS Checkin
 
 on:
   schedule:
-    # 北京时间 16:00 / 17:00 / 18:00 / 19:00
+    # 北京时间 16:00 / 17:00 / 18:00 / 19:00。成功后只跳过后续执行，不删除这四档。
     - cron: "0 8,9,10,11 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: 忽略当日成功标记，重新运行核验
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
     steps:
+      - name: Beijing date
+        id: day
+        run: echo "day=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore today's success lock
+        id: lock
+        uses: actions/cache/restore@v4
+        with:
+          path: .glados-checkin-lock
+          key: glados-checkin-success-${{ steps.day.outputs.day }}
+
+      - name: Skip after today's success
+        if: ${{ steps.lock.outputs.cache-hit == 'true' && (github.event_name != 'workflow_dispatch' || inputs.force != true) }}
+        run: echo "今日 ${{ steps.day.outputs.day }} 已有成功标记，跳过 Python 与 GLaDOS API"
+
       - uses: actions/checkout@v4
+        if: ${{ steps.lock.outputs.cache-hit != 'true' || (github.event_name == 'workflow_dispatch' && inputs.force == true) }}
+
       - uses: actions/setup-python@v5
+        if: ${{ steps.lock.outputs.cache-hit != 'true' || (github.event_name == 'workflow_dispatch' && inputs.force == true) }}
         with:
           python-version: "3.12"
+
       - name: Check in
+        id: checkin
+        if: ${{ steps.lock.outputs.cache-hit != 'true' || (github.event_name == 'workflow_dispatch' && inputs.force == true) }}
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
           GLADOS_USER_AGENT: ${{ vars.GLADOS_USER_AGENT || secrets.GLADOS_USER_AGENT }}
-        run: python checkin.py
+        run: |
+          set -o pipefail
+          python -u checkin.py | tee "$RUNNER_TEMP/glados-checkin-output.txt"
+          if grep -qx 'GLADOS_DAY_LOCK=acquired' "$RUNNER_TEMP/glados-checkin-output.txt"; then
+            mkdir -p .glados-checkin-lock
+            printf 'glados-checkin-success-%s\n' "${{ steps.day.outputs.day }}" > .glados-checkin-lock/success
+            echo "acquired=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "acquired=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save today's success lock
+        if: ${{ steps.checkin.outputs.acquired == 'true' && steps.lock.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .glados-checkin-lock
+          key: glados-checkin-success-${{ steps.day.outputs.day }}

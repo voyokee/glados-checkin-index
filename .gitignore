@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 *.log
+.glados-checkin-lock/
 __pycache__/
 .venv/
 venv/

@@ -1,13 +1,16 @@
-# GLaDOS 自动签到
+# GLaDOS 自动签到 v0.2
 
-按 2026 年浏览器真实请求写的极简签到脚本：`POST https://glados.rocks/api/user/checkin`，body 为 `{"token":"<host>"}`。
+按 2026 年官网控制台的一次性签到协议：先 `GET /api/user/checkin/challenge`，等待至少 **2.7 秒**，再在**签发该验证的同一域名**提交 `POST /api/user/checkin`。请求体是 `{"token":"<host>","nonce":"<nonce>","proof":"<sha256>"}`，其中 `proof = SHA-256(nonce + ".glados-observe-v1")`。TTL 盖不住这次等待、或等待后已经到期的验证不会提交。失败重试会重新取 challenge，不会拿旧 nonce 去打另一个域名，也不会退回只提交 token 的旧请求。
+
+协议依据 [lankerr/2026-glados-checkin](https://github.com/lankerr/2026-glados-checkin) 的 PR #31、#33，以及 issue #28 中 chengchang1987-cloud 提供的 challenge 证据。本仓库只吸收这条签到链路，仍用标准库 `urllib`，不引入自动兑换或推送。
 
 - **零依赖**：只用 Python 标准库（`urllib`），无需 `pip install`
 - **IQI 四档签到**：16:00 `<80` / 17:00 `<85` / 18:00 `<90` / 19:00 任意 Index 兜底，优先拿 Cable +8
-- **多域名兜底**：依次尝试 `glados.cloud` / `glados.rocks` / `glados.network`
+- **19:00 兜底**：这一档即使 IQI 查询失败也会签到。认证被拒绝时停止，不会换成别的域名硬签
+- **多域名**：challenge 可以换域名重新获取；真正的签到 POST 只打签发域名
 - **两种部署**：Windows 计划任务，或 GitHub Actions
 
-认证只靠登录 Cookie（`koa:sess` / `koa:sess.sig`）。**Cookie 只放 `.env` 或 GitHub Actions Secrets，绝不提交进仓库。**
+认证接受完整的 `gld:sess` + `gld:sess.sig`，也接受旧的 `koa:sess` + `koa:sess.sig`。旧对仍会尝试，但 2026 接口可能直接拒绝。**Cookie 和 User-Agent 只放 `.env` 或 GitHub Actions Secrets，绝不提交进仓库，日志也不打印这些值。**
 
 > 网上很多老脚本仍请求 `glados.cloud` / `glados.one`，可能和当前控制台不一致。以你自己抓到的 host / token 为准。
 
@@ -22,6 +25,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | `checkin.py` | 主脚本，零依赖 |
+| `tests/test_checkin_v02.py` | Mock API 单测 |
 | `install-task.ps1` | 注册 Windows 计划任务 |
 | `.github/workflows/checkin.yml` | GitHub Actions 定时任务 |
 | `.env.example` | 环境变量模板 |
@@ -49,7 +53,7 @@
 
 因此「线路越差，签到积分越高」不是装饰文案，而是真正在算分。
 
-同一天重复请求只会返回已签到（`code=1`），不会拿两份积分。更合理的是每天一次，失败再重试。
+同一天重复请求只会返回已签到（`code=1`），不会拿两份积分。更合理的是每天一次，失败再重试。签到后会读 Points History 核对当天入账；若只看到 1 分或更低，只把这一条记成低奖励异常，**不再次签到**。在下一次真实首次签到被流水核对之前，不能把某次入账说成奖励已经恢复。
 
 参考：[GLaDOS 控制台](https://glados.network/console)
 
@@ -100,14 +104,19 @@
 | **18:00** | Index **< 90** |
 | **19:00** | **anyscore**（任意 Index，确保今日签到） |
 
-判断顺序：窗口检查 → 今日是否已签 → 查询 `/api/user/iqi` → 按上表决定是否调用签到。IQI 失败时不签，等下一档。
+判断顺序：窗口检查 → 今日是否已签 → 查询 `/api/user/iqi` → 按上表决定是否调用签到。16:00–18:59 若 IQI 失败，本次不签，等下一档。**19:00 的 IQI 网络或响应失败仍会兜底签到**；认证被拒绝则停止，不会换域名或再试。
 
-示例：Index 全天 82 → 16:00 不签（≥80）→ 17:00 签（<85）。若 16–18 点都未签，19:00 仍会签到以免断签。
+示例：Index 全天 82 → 16:00 不签（≥80）→ 17:00 签（<85）。若 16–18 点都未签，19:00 仍会签到以免断签。19:00 即使 IQI 接口失败，也会走兜底。
 
-阈值逻辑可单独自测：
+签到请求失败时会重新获取 challenge，不会复用旧 nonce。`401` / `403`、`code=-2`、无权限或自动签到拒绝会立即停止。
+
+签到后读取 Points History 核对今日入账。低奖励只记一条异常日志，**不再次签到**。流水还没证明奖励数额，不能据此认为积分已经恢复。
+
+阈值与 Mock API 测试：
 
 ```powershell
 py -3 checkin.py --test-threshold
+py -3 -m unittest discover -s tests -v
 ```
 
 ---
@@ -144,8 +153,9 @@ py -3 checkin.py --test-threshold
 
 | 变量 | 说明 |
 | --- | --- |
-| `GLADOS_COOKIE` | 必填。浏览器 checkin 请求里的整段 Cookie |
-| `GLADOS_HOST` | 可选。默认 `glados.rocks`；body 的 token 会跟着这个 host |
+| `GLADOS_COOKIE` | 必填。完整的 `gld:sess` + `gld:sess.sig`，或旧版 `koa:sess` + `koa:sess.sig`。日志不会打印 Cookie |
+| `GLADOS_USER_AGENT` | 可选。建议填签发 Cookie 的同一浏览器 User-Agent。可带外层引号或 `User-Agent:` 前缀，脚本会去掉。留空则用内置默认值，日志只写“已配置/默认”，不写原文 |
+| `GLADOS_HOST` | 可选。优先尝试的域名；实际 `token` 以签发 challenge 的域名为准 |
 | `GLADOS_PROXY` | 可选。不填则自动探测本机 `7897 / 7890 / 10809 / 1087`；GitHub Actions 上留空走直连 |
 
 接口返回约定：
@@ -160,7 +170,7 @@ py -3 checkin.py --test-threshold
 powershell -ExecutionPolicy Bypass -File .\install-task.ps1
 ```
 
-默认定时 **16:00 / 17:00 / 18:00 / 19:00** 四档；已开启 **唤醒计算机以运行此任务**。日志见 `checkin.log`。
+默认定时仍是 **16:00 / 17:00 / 18:00 / 19:00** 四档；已开启 **唤醒计算机以运行此任务**。v0.2 不改这四个时间。日志见 `checkin.log`。
 
 注意：仅对**睡眠**有效，关机/休眠后无法唤醒；部分笔记本需在 BIOS 或电源选项里允许「定时器唤醒」。
 
@@ -176,7 +186,7 @@ Unregister-ScheduledTask -TaskName GLaDOS-Checkin -Confirm:$false
 
 `Settings → Secrets and variables → Actions`
 
-不要把 `.env` 或 `checkin.log` 推上去。Workflow 与本地一致，在北京时间 **16:00 / 17:00 / 18:00 / 19:00** 各跑一次；GitHub 可能延迟，本机计划任务更稳。
+不要把 `.env` 或 `checkin.log` 推上去。Workflow 与本地一致，cron 仍是北京时间 **16:00 / 17:00 / 18:00 / 19:00**。可选 User-Agent 放在 Actions Variables 或 Secrets 的 `GLADOS_USER_AGENT`。GitHub 可能延迟，本机计划任务更稳。
 
 ---
 

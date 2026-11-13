@@ -9,8 +9,8 @@ $action = New-ScheduledTaskAction `
     -WorkingDirectory $dir
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
-# 四档：16:00 <80 | 17:00 <85 | 18:00 <90 | 19:00 anyscore
-$times = @("16:00", "17:00", "18:00", "19:00")
+# 00:01 首次 | 00:31 第一次补签 | 01:01 第二次补签 | 01:31 最后一次补签
+$times = @("00:01", "00:31", "01:01", "01:31")
 $triggers = $times | ForEach-Object { New-ScheduledTaskTrigger -Daily -At $_ }
 
 $settings = New-ScheduledTaskSettingsSet `
@@ -26,11 +26,11 @@ Register-ScheduledTask `
     -Trigger $triggers `
     -Settings $settings `
     -Principal $principal `
-    -Description "GLaDOS 4-tier IQI check-in" `
+    -Description "GLaDOS 4-tier check-in 00:01-01:31" `
     -Force | Out-Null
 
 Write-Host "Registered scheduled task $taskName with $($times.Count) daily triggers."
-Write-Host "  16:00 Index<80 | 17:00 Index<85 | 18:00 Index<90 | 19:00 anyscore"
+Write-Host "  00:01 Index<90 | 00:31 Index<95 | 01:01 Index<100 | 01:31 unconditional"
 Write-Host "  Wake: enabled"
 Write-Host "Run now: Start-ScheduledTask -TaskName $taskName"
 Write-Host "Log file: $dir\checkin.log"

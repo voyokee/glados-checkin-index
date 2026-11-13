@@ -42,15 +42,15 @@ _COOKIE_PAIR_RE = re.compile(r"(?:gld|koa):sess(?:\.sig)?=[^;\s]+", re.IGNORECAS
 _GOT_POINTS_RE = re.compile(r"got\s+(\d+)\s+point", re.IGNORECASE)
 _secrets: list[str] = []
 
-# 每天 4 档（对应计划任务 16/17/18/19 点），Index 严格小于该值才签；最后一档 anyscore
+# 每天 4 档（对应计划任务 00:01 / 00:31 / 01:01 / 01:31），值为从 0:00 起的分钟数
 CHECKIN_SCHEDULE = (
-    (16, 80),
-    (17, 85),
-    (18, 90),
-    (19, None),
+    (0 * 60 + 1, 90),
+    (0 * 60 + 31, 95),
+    (1 * 60 + 1, 100),
+    (1 * 60 + 31, None),
 )
-WINDOW_START_MINUTES = 16 * 60
-WINDOW_END_MINUTES = 19 * 60 + 59
+WINDOW_START_MINUTES = 0 * 60 + 1
+WINDOW_END_MINUTES = 1 * 60 + 59
 
 AnyScore = Literal["ANY"]
 ThresholdResult = int | AnyScore | None
@@ -80,13 +80,13 @@ class ApiError(Exception):
 
 def schedule_label(threshold: ThresholdResult) -> str:
     if threshold == "ANY":
-        return "19:00 anyscore"
-    if threshold == 80:
-        return "16:00 Index<80 (+8档)"
-    if threshold == 85:
-        return "17:00 Index<85"
+        return "01:31 最后一次补签 无条件"
     if threshold == 90:
-        return "18:00 Index<90"
+        return "00:01 首次签到 Index<90 (+9)"
+    if threshold == 95:
+        return "00:31 第一次补签 Index<95 (+7)"
+    if threshold == 100:
+        return "01:01 第二次补签 Index<100 (+5)"
     return str(threshold)
 
 
@@ -237,14 +237,13 @@ def minutes_of_day(now: datetime) -> int:
 
 
 def get_iqi_threshold(now: datetime) -> ThresholdResult:
-    """按当前北京时间所在档位返回 Index 上界或 ANY（19:00 任意 Index 签到）。"""
+    """按当前北京时间所在档位返回 Index 上界或 ANY（01:31 任意 Index 签到）。"""
     minutes = minutes_of_day(now)
     if minutes < WINDOW_START_MINUTES or minutes > WINDOW_END_MINUTES:
         return None
-    hour = now.astimezone(TZ_CST).hour
     result: ThresholdResult = None
-    for start_hour, bound in CHECKIN_SCHEDULE:
-        if hour >= start_hour:
+    for start_minutes, bound in CHECKIN_SCHEDULE:
+        if minutes >= start_minutes:
             result = "ANY" if bound is None else bound
     return result
 
@@ -779,7 +778,7 @@ def run(now: datetime | None = None) -> int:
 
     threshold = get_iqi_threshold(now)
     if threshold is None:
-        log("不在 16:00–19:59 签到窗口，退出")
+        log("不在 00:01–01:59 签到窗口，退出")
         return finish(0, lock=False, now=now)
 
     log(f"当前档位: {schedule_label(threshold)}")
@@ -805,7 +804,7 @@ def run(now: datetime | None = None) -> int:
         log("查询今日签到状态失败")
         return finish(2, lock=False, now=now)
     if points_payload is None:
-        log("查询今日签到状态失败，19:00 anyscore 仍尝试兜底签到")
+        log("查询今日签到状态失败，01:31 无条件仍尝试兜底签到")
 
     score: float | None = None
     try:
@@ -822,12 +821,12 @@ def run(now: datetime | None = None) -> int:
         if threshold != "ANY":
             log("IQI 查询失败，等待下一档")
             return finish(0, lock=False, now=now)
-        log("IQI 查询失败，19:00 anyscore 仍执行兜底签到")
+        log("IQI 查询失败，01:31 无条件仍执行兜底签到")
     except Exception:
         if threshold != "ANY":
             log("IQI 查询失败，等待下一档")
             return finish(0, lock=False, now=now)
-        log("IQI 查询失败，19:00 anyscore 仍执行兜底签到")
+        log("IQI 查询失败，01:31 无条件仍执行兜底签到")
 
     if threshold != "ANY":
         assert score is not None
@@ -848,14 +847,14 @@ def run(now: datetime | None = None) -> int:
 
 def _test_thresholds() -> None:
     cases = [
-        ("15:59", None),
-        ("16:00", 80),
-        ("16:59", 80),
-        ("17:00", 85),
-        ("18:00", 90),
-        ("19:00", "ANY"),
-        ("19:30", "ANY"),
-        ("20:00", None),
+        ("00:00", None),
+        ("00:01", 90),
+        ("00:30", 90),
+        ("00:31", 95),
+        ("01:01", 100),
+        ("01:31", "ANY"),
+        ("01:45", "ANY"),
+        ("02:00", None),
     ]
     for hm, expected in cases:
         hour, minute = map(int, hm.split(":"))

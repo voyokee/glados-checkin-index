@@ -314,49 +314,49 @@ class FlowTests(unittest.TestCase):
 
     def test_threshold_matrix_and_strict_less_than(self) -> None:
         checkin._test_thresholds()
-        self.iqi_score = 80
-        self.assertEqual(checkin.run(at(16)), 0)
+        self.iqi_score = 90
+        self.assertEqual(checkin.run(at(0, 1)), 0)
         self.assertEqual(self.posts(), [])
         self.calls.clear()
-        self.iqi_score = 79
-        self.assertEqual(checkin.run(at(16)), 0)
+        self.iqi_score = 89
+        self.assertEqual(checkin.run(at(0, 1)), 0)
         self.assertEqual(len(self.posts()), 1)
         body = self.posts()[0][3]
         self.assertEqual(body["proof"], checkin.build_proof(body["nonce"]))
 
     def test_later_slots_and_anyscore(self) -> None:
-        self.iqi_score = 85
-        self.assertEqual(checkin.run(at(17)), 0)
+        self.iqi_score = 95
+        self.assertEqual(checkin.run(at(0, 31)), 0)
         self.assertEqual(self.posts(), [])
         self.calls.clear()
-        self.iqi_score = 90
-        self.assertEqual(checkin.run(at(18)), 0)
+        self.iqi_score = 100
+        self.assertEqual(checkin.run(at(1, 1)), 0)
         self.assertEqual(self.posts(), [])
         self.calls.clear()
         self.iqi_score = 99
         self.after_checkin = 2
-        self.assertEqual(checkin.run(at(19)), 0)
+        self.assertEqual(checkin.run(at(1, 31)), 0)
         self.assertEqual(len(self.posts()), 1)
 
-    def test_iqi_failure_waits_until_1900_fallback(self) -> None:
+    def test_iqi_failure_waits_until_0131_fallback(self) -> None:
         self.iqi_error = checkin.ApiError("network", retryable=True)
-        self.assertEqual(checkin.run(at(18)), 0)
+        self.assertEqual(checkin.run(at(1, 1)), 0)
         self.assertEqual(self.posts(), [])
         self.assertIn("等待下一档", self.log_text())
         self.calls.clear()
-        self.assertEqual(checkin.run(at(19)), 0)
+        self.assertEqual(checkin.run(at(1, 31)), 0)
         self.assertEqual(len(self.posts()), 1)
         self.assertIn("兜底签到", self.log_text())
 
     def test_iqi_auth_failure_does_not_fallback(self) -> None:
         self.iqi_error = checkin.ApiError("http-auth-rejected", retryable=False, http_status=401)
-        self.assertEqual(checkin.run(at(19)), 1)
+        self.assertEqual(checkin.run(at(1, 31)), 1)
         self.assertEqual(self.posts(), [])
 
     def test_low_reward_is_logged_once(self) -> None:
         self.checkin_message = "Checkin! Got 1 Points"
         self.after_checkin = 1
-        self.assertEqual(checkin.run(at(16, 10)), 0)
+        self.assertEqual(checkin.run(at(0, 10)), 0)
         self.assertEqual(len(self.posts()), 1)
         self.assertIn("低奖励异常", self.log_text())
         self.assertIn("不重复签到", self.log_text())
@@ -371,40 +371,40 @@ class FlowTests(unittest.TestCase):
         return lines[0]
 
     def test_day_lock_stays_open_when_index_misses(self) -> None:
-        self.iqi_score = 80
-        self.assertEqual(self.lock_line(at(16)), "GLADOS_DAY_LOCK=open")
+        self.iqi_score = 90
+        self.assertEqual(self.lock_line(at(0, 1)), "GLADOS_DAY_LOCK=open")
         self.assertEqual(self.posts(), [])
 
     def test_day_lock_acquired_after_success_or_existing_history(self) -> None:
         self.after_checkin = 9
-        self.assertEqual(self.lock_line(at(16)), "GLADOS_DAY_LOCK=acquired")
+        self.assertEqual(self.lock_line(at(0, 1)), "GLADOS_DAY_LOCK=acquired")
         self.calls.clear()
         self.points_change = 9
         self.after_checkin = None
-        self.assertEqual(self.lock_line(at(17)), "GLADOS_DAY_LOCK=acquired")
+        self.assertEqual(self.lock_line(at(0, 31)), "GLADOS_DAY_LOCK=acquired")
         self.assertEqual(self.posts(), [])
 
     def test_local_lock_skips_later_slots_and_resets_next_day(self) -> None:
         self.after_checkin = 9
-        self.assertEqual(checkin.run(at(16)), 0)
-        self.assertTrue(checkin.local_day_locked(at(17)))
+        self.assertEqual(checkin.run(at(0, 1)), 0)
+        self.assertTrue(checkin.local_day_locked(at(0, 31)))
         self.calls.clear()
-        self.assertEqual(checkin.run(at(17)), 0)
+        self.assertEqual(checkin.run(at(0, 31)), 0)
         self.assertEqual(self.calls, [])
         self.assertIn("跳过 GLaDOS API", self.log_text())
         os.environ["GLADOS_FORCE"] = "1"
-        self.assertEqual(checkin.run(at(18)), 0)
+        self.assertEqual(checkin.run(at(1, 1)), 0)
         self.assertTrue(self.calls)
         os.environ["GLADOS_FORCE"] = ""
         self.calls.clear()
-        next_day = at(16).replace(day=10)
+        next_day = at(0, 1).replace(day=10)
         self.assertFalse(checkin.local_day_locked(next_day))
         self.assertEqual(checkin.run(next_day), 0)
         self.assertTrue(self.calls)
 
     def test_already_checked_in_does_not_post(self) -> None:
         self.points_change = 9
-        self.assertEqual(checkin.run(at(19)), 0)
+        self.assertEqual(checkin.run(at(1, 31)), 0)
         self.assertEqual(self.posts(), [])
         self.assertIn("今日已签到", self.log_text())
         self.assertNotIn(NONCE, self.log_text())
@@ -412,7 +412,7 @@ class FlowTests(unittest.TestCase):
     def test_retry_after_failed_class_uses_new_challenge(self) -> None:
         self.checkin_code = 2
         self.checkin_message = "temporary"
-        self.assertEqual(checkin.run(at(16)), 1)
+        self.assertEqual(checkin.run(at(0, 1)), 1)
         self.assertEqual(len(self.posts()), 3)
         nonces = [call[3]["nonce"] for call in self.posts()]
         self.assertNotEqual(nonces[0], nonces[1])
@@ -424,7 +424,7 @@ class FlowTests(unittest.TestCase):
 
     def test_logs_do_not_contain_credentials(self) -> None:
         self.after_checkin = 9
-        checkin.run(at(16))
+        checkin.run(at(0, 1))
         text = self.log_text()
         self.assertNotIn("synthetic-private", text)
         self.assertNotIn(NONCE, text)

@@ -254,6 +254,7 @@ class FlowTests(unittest.TestCase):
         self.iqi_score = 70
         self.checkin_code = 0
         self.checkin_message = "Checkin! Got 9 Points"
+        self.checkin_reason = ""
         self.challenge_code = 0
         env = {
             "GLADOS_COOKIE": COOKIE,
@@ -265,6 +266,8 @@ class FlowTests(unittest.TestCase):
             "GLADOS_HOST": "",
             "GLADOS_LOCK_DIR": os.path.join(self.tmp.name, "lock"),
             "GLADOS_FORCE": "",
+            "GLADOS_READONLY": "",
+            "GITHUB_ACTIONS": "",
         }
         self._patches = [
             mock.patch("checkin.time.sleep", self.clock.sleep),
@@ -300,7 +303,10 @@ class FlowTests(unittest.TestCase):
             nonce = NONCE if not any(item[1] == "POST" for item in self.calls) else OTHER_NONCE
             return 200, {"code": 0, "nonce": nonce, "ttl": 300000}
         if path == "/api/user/checkin":
-            return 200, {"code": self.checkin_code, "message": self.checkin_message}
+            payload = {"code": self.checkin_code, "message": self.checkin_message}
+            if self.checkin_reason:
+                payload["reason"] = self.checkin_reason
+            return 200, payload
         if path == "/api/user/status":
             return 200, {"code": 0, "data": {"leftDays": 30, "email": "hidden@example.test"}}
         raise AssertionError(path)

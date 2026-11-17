@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GLaDOS v0.2：IQI 四档签到，提交 challenge/nonce/proof。Cookie 只从环境变量或 .env 读取。"""
+"""GLaDOS v0.2：IQI 四档签到。API 仍提交 challenge/nonce/proof；遇到 Turnstile 时改由本机浏览器打开官方页面。Cookie 只从环境变量或 .env 读取。"""
 
 from __future__ import annotations
 
@@ -390,10 +390,12 @@ def classify_checkin_result(payload: dict) -> str:
         return "challenge-unavailable"
     if reason == "checkin-challenge-expired":
         return "challenge-expired"
+    code = payload.get("code")
+    if reason == "turnstile" or (code == 5 and "turnstile" in reason):
+        return "turnstile"
     if is_auth_payload(payload):
         return "auth"
     message = str(payload.get("message", "")).strip().lower()
-    code = payload.get("code")
     if code == 1 or "repeat" in message or "try tomorrow" in message or "return tomorrow" in message:
         return "already"
     if code == 0 or "checkin! got" in message or "observation logged" in message:
@@ -675,7 +677,12 @@ def emit_day_lock(acquired: bool) -> None:
 
 def lock_dir() -> Path:
     override = os.environ.get("GLADOS_LOCK_DIR", "").strip()
-    return Path(override) if override else ROOT / ".glados-checkin-lock"
+    if override:
+        return Path(override)
+    base = os.environ.get("LOCALAPPDATA", "").strip()
+    if base:
+        return Path(base) / "glados-checkin" / "state"
+    return ROOT / ".glados-checkin-lock"
 
 
 def day_key(now: datetime) -> str:
@@ -686,14 +693,129 @@ def local_lock_path(now: datetime) -> Path:
     return lock_dir() / f"glados-checkin-success-{day_key(now)}"
 
 
+def unknown_lock_path(now: datetime) -> Path:
+    return lock_dir() / f"glados-checkin-unknown-{day_key(now)}"
+
+
+def process_lock_path() -> Path:
+    return lock_dir() / "glados-checkin-process.lock"
+
+
 def local_day_locked(now: datetime) -> bool:
     return local_lock_path(now).is_file()
 
 
-def write_local_day_lock(now: datetime) -> None:
-    path = local_lock_path(now)
+def unknown_locked(now: datetime) -> bool:
+    return unknown_lock_path(now).is_file()
+
+
+def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"glados-checkin-success-{day_key(now)}\n", encoding="utf-8")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def clear_unknown_lock(now: datetime) -> None:
+    try:
+        unknown_lock_path(now).unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
+def write_unknown_lock(now: datetime, reason: str) -> None:
+    if not re.fullmatch(r"[a-z0-9-]{1,40}", reason):
+        reason = "unspecified"
+    _atomic_write(unknown_lock_path(now), f"unknown {day_key(now)} reason={reason}\n")
+
+
+def write_local_day_lock(now: datetime) -> None:
+    stamp = now.astimezone(TZ_CST).strftime("%Y-%m-%d %H:%M:%S")
+    _atomic_write(local_lock_path(now), f"glados-checkin-success-{day_key(now)} at={stamp}\n")
+    clear_unknown_lock(now)
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        kernel = ctypes.windll.kernel32
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        kernel.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def process_lock_is_stale() -> bool:
+    path = process_lock_path()
+    if not path.exists():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not text:
+        try:
+            age = time.time() - path.stat().st_mtime
+        except OSError:
+            return False
+        return age > 2
+    try:
+        owner = int(text)
+    except ValueError:
+        return True
+    return not _pid_alive(owner)
+
+
+def acquire_process_lock() -> bool:
+    path = process_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(5):
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if not process_lock_is_stale():
+                return False
+            try:
+                path.unlink()
+            except OSError:
+                return False
+            continue
+        else:
+            try:
+                os.write(fd, str(os.getpid()).encode("ascii"))
+            finally:
+                os.close(fd)
+            return True
+    return False
+
+
+def release_process_lock() -> None:
+    path = process_lock_path()
+    try:
+        owner = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return
+    if owner != os.getpid():
+        return
+    try:
+        path.unlink()
+    except OSError:
+        return
 
 
 def force_requested() -> bool:
@@ -757,11 +879,465 @@ def do_checkin(
     return 1
 
 
-def run(now: datetime | None = None) -> int:
-    load_dotenv()
-    now = now or beijing_now()
+POST_UNCERTAIN_REASONS = {"network", "http-transient", "invalid-response", "all-domains-failed"}
+
+
+def slot_of(now: datetime) -> str:
+    minutes = minutes_of_day(now)
+    if minutes < 31:
+        return "00:01"
+    if minutes < 61:
+        return "00:31"
+    if minutes < 91:
+        return "01:01"
+    return "01:31"
+
+
+def index_text(score: float | None) -> str:
+    if score is None:
+        return "na"
+    return f"{score:g}"
+
+
+def log_event(
+    event: str,
+    *,
+    slot: str,
+    index: str,
+    channel: str,
+    retry: int,
+    result: str,
+    lock_written: bool,
+) -> None:
+    lock_text = "yes" if lock_written else "no"
+    log(
+        f"{event} slot={slot} index={index} channel={channel} "
+        f"retry={retry} result={result} lock={lock_text}"
+    )
+
+
+def readonly_requested() -> bool:
+    if os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true":
+        return True
+    return os.environ.get("GLADOS_READONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def account_email(
+    opener: urllib.request.OpenerDirector,
+    cookie_header: str,
+    user_agent: str,
+    host: str,
+) -> str | None:
+    try:
+        status, payload = api(opener, host, "GET", "/api/user/status", cookie_header, None, user_agent)
+    except Exception:
+        return None
+    if status != 200 or not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    email = data.get("email")
+    if not isinstance(email, str):
+        return None
+    email = email.strip()
+    if not email or email in {"?", "Unknown"}:
+        return None
+    register_secret(email)
+    return email
+
+
+def submission_visible(
+    opener: urllib.request.OpenerDirector,
+    cookie_header: str,
+    user_agent: str,
+    now: datetime,
+) -> str:
+    try:
+        status, payload = api(
+            opener, domain_list()[0], "GET", "/api/user/points", cookie_header, None, user_agent
+        )
+    except Exception:
+        return "unknown"
+    if status != 200 or not isinstance(payload, dict) or payload.get("code") not in (None, 0):
+        return "unknown"
+    if already_checked_in_today(payload, now):
+        return "already"
+    return "absent"
+
+
+def finalize_accepted(
+    opener: urllib.request.OpenerDirector,
+    cookie_header: str,
+    user_agent: str,
+    now: datetime,
+    payload: dict,
+    *,
+    already: bool,
+    channel: str,
+    score: float | None,
+    attempt: int,
+) -> int:
+    try:
+        _host, _status, status_payload = api_with_domains(
+            opener, "GET", "/api/user/status", cookie_header, None, user_agent
+        )
+        log(f"status {summarize_status(status_payload)}")
+    except Exception:
+        log("查询 status 失败")
+    awarded = None if already else awarded_from_message(payload)
+    verify_points(opener, cookie_header, user_agent, now, awarded, already=already)
+    if already:
+        event = "ALREADY_CHECKED_IN"
+        result = "already"
+    elif channel == "browser":
+        event = "BROWSER_CHECKIN_SUCCESS"
+        result = "success"
+    else:
+        event = "API_CHECKIN_SUCCESS"
+        result = "success"
+    log_event(
+        event,
+        slot=slot_of(now),
+        index=index_text(score),
+        channel=channel,
+        retry=attempt,
+        result=result,
+        lock_written=True,
+    )
+    return 0
+
+
+def perform_browser_checkin(*, host: str, expected_email: str, on_before_submit, emit, log) -> dict:
+    from browser_checkin import run_browser_checkin
+
+    return run_browser_checkin(
+        host=host,
+        expected_email=expected_email,
+        on_before_submit=on_before_submit,
+        emit=emit,
+        log=log,
+    )
+
+
+def _browser_event(slot: str, score: float | None, attempt: int, event: str) -> None:
+    log_event(
+        event,
+        slot=slot,
+        index=index_text(score),
+        channel="browser",
+        retry=attempt,
+        result="pending" if event == "TURNSTILE_VERIFICATION_PENDING" else "started",
+        lock_written=False,
+    )
+
+
+def _remember_unknown(now: datetime, slot: str, score: float | None, attempt: int, channel: str) -> int:
+    if not unknown_locked(now):
+        write_unknown_lock(now, f"{channel}-unknown")
+    log("签到请求可能已发出，但结果无法确认")
+    log_event(
+        "OUTCOME_UNKNOWN",
+        slot=slot,
+        index=index_text(score),
+        channel=channel,
+        retry=attempt,
+        result="unknown",
+        lock_written=False,
+    )
+    return 2
+
+
+def submit_browser(
+    opener: urllib.request.OpenerDirector,
+    cookie_header: str,
+    user_agent: str,
+    now: datetime,
+    score: float | None,
+    host: str,
+) -> int:
+    slot = slot_of(now)
+    email = account_email(opener, cookie_header, user_agent, host)
+    if email is None:
+        log("无法核对浏览器登录身份，未点击签到")
+        return 1
+    for attempt in range(1, CHECKIN_ATTEMPTS + 1):
+        def emit(event: str, attempt: int = attempt) -> None:
+            _browser_event(slot, score, attempt, event)
+
+        def on_before_submit() -> None:
+            write_unknown_lock(now, "browser-submit")
+
+        try:
+            result = perform_browser_checkin(
+                host=host,
+                expected_email=email,
+                on_before_submit=on_before_submit,
+                emit=emit,
+                log=log,
+            )
+        except Exception:
+            return _remember_unknown(now, slot, score, attempt, "browser")
+        if not isinstance(result, dict):
+            return _remember_unknown(now, slot, score, attempt, "browser")
+        failure = result.get("failure")
+        submitted = bool(result.get("submitted"))
+        payload = result.get("payload")
+        if failure == "identity_unverified" and not submitted:
+            log("浏览器登录身份与当前 Cookie 不一致，未点击签到")
+            return 1
+        if failure == "unknown" or (submitted and not isinstance(payload, dict)):
+            return _remember_unknown(now, slot, score, attempt, "browser")
+        if not submitted and failure in {"launch_failed", "button_unavailable", "pending"}:
+            if failure == "pending":
+                log("Turnstile 仍需人工处理，本次未提交签到")
+            else:
+                log("浏览器未能启动或签到按钮不可用，未提交签到")
+            log_event(
+                "RETRYABLE_FAILURE",
+                slot=slot,
+                index=index_text(score),
+                channel="browser",
+                retry=attempt,
+                result="failed",
+                lock_written=False,
+            )
+            if attempt < CHECKIN_ATTEMPTS:
+                time.sleep(2 * attempt)
+            continue
+        if not isinstance(payload, dict):
+            return _remember_unknown(now, slot, score, attempt, "browser")
+        kind = classify_checkin_result(payload)
+        code = payload.get("code")
+        code_text = str(code) if type(code) is int else "none"
+        log(f"browser checkin class={kind} code={code_text}")
+        if kind in {"success", "already"}:
+            return finalize_accepted(
+                opener,
+                cookie_header,
+                user_agent,
+                now,
+                payload,
+                already=kind == "already",
+                channel="browser",
+                score=score,
+                attempt=attempt,
+            )
+        if kind == "auth":
+            clear_unknown_lock(now)
+            log("浏览器签到认证失败，停止重试")
+            return 1
+        if kind in {"turnstile", "failed"}:
+            clear_unknown_lock(now)
+            log(f"浏览器签到被拒绝 class={kind}")
+            log_event(
+                "RETRYABLE_FAILURE",
+                slot=slot,
+                index=index_text(score),
+                channel="browser",
+                retry=attempt,
+                result="failed",
+                lock_written=False,
+            )
+            if attempt < CHECKIN_ATTEMPTS:
+                time.sleep(2 * attempt)
+            continue
+        return _remember_unknown(now, slot, score, attempt, "browser")
+    log("签到失败：重试后仍未成功。认证错误不会继续重试。")
+    return 1
+
+
+def submit_with_policy(
+    opener: urllib.request.OpenerDirector,
+    cookie_header: str,
+    user_agent: str,
+    now: datetime,
+    score: float | None,
+) -> int:
+    slot = slot_of(now)
+    for attempt in range(1, CHECKIN_ATTEMPTS + 1):
+        try:
+            host, status, payload = checkin_once(opener, cookie_header, user_agent)
+        except ApiError as exc:
+            if not exc.retryable:
+                log(f"签到认证失败，停止重试 reason={exc.reason}")
+                return 1
+            if exc.reason in POST_UNCERTAIN_REASONS:
+                visible = submission_visible(opener, cookie_header, user_agent, now)
+                if visible == "already":
+                    log("请求异常后积分流水显示今日已签到")
+                    return finalize_accepted(
+                        opener,
+                        cookie_header,
+                        user_agent,
+                        now,
+                        {"code": 1},
+                        already=True,
+                        channel="api",
+                        score=score,
+                        attempt=attempt,
+                    )
+                if visible == "unknown":
+                    write_unknown_lock(now, "api-timeout")
+                    log("签到请求可能已发出，但结果无法确认")
+                    log_event(
+                        "OUTCOME_UNKNOWN",
+                        slot=slot,
+                        index=index_text(score),
+                        channel="api",
+                        retry=attempt,
+                        result="unknown",
+                        lock_written=False,
+                    )
+                    return 2
+            log(f"签到第 {attempt}/{CHECKIN_ATTEMPTS} 次未提交成功 reason={exc.reason}")
+            log_event(
+                "RETRYABLE_FAILURE",
+                slot=slot,
+                index=index_text(score),
+                channel="api",
+                retry=attempt,
+                result="failed",
+                lock_written=False,
+            )
+            if attempt < CHECKIN_ATTEMPTS:
+                time.sleep(2 * attempt)
+            continue
+
+        kind = classify_checkin_result(payload)
+        code = payload.get("code")
+        code_text = str(code) if type(code) is int else "none"
+        log(f"checkin host={host} http={status} class={kind} code={code_text}")
+        if kind == "turnstile":
+            log("签到接口要求 Turnstile，停止重复调用 API，改用浏览器")
+            log_event(
+                "TURNSTILE_DETECTED",
+                slot=slot,
+                index=index_text(score),
+                channel="api",
+                retry=attempt,
+                result="turnstile",
+                lock_written=False,
+            )
+            return submit_browser(opener, cookie_header, user_agent, now, score, host)
+        if kind == "auth":
+            log("签到认证失败，停止重试")
+            return 1
+        if kind in {"success", "already"}:
+            return finalize_accepted(
+                opener,
+                cookie_header,
+                user_agent,
+                now,
+                payload,
+                already=kind == "already",
+                channel="api",
+                score=score,
+                attempt=attempt,
+            )
+        log(f"签到结果未成功 class={kind}")
+        log_event(
+            "RETRYABLE_FAILURE",
+            slot=slot,
+            index=index_text(score),
+            channel="api",
+            retry=attempt,
+            result="failed",
+            lock_written=False,
+        )
+        if attempt < CHECKIN_ATTEMPTS:
+            time.sleep(2 * attempt)
+    log("签到失败：重试后仍未成功。认证错误不会继续重试。")
+    return 1
+
+
+def reconcile_unknown(
+    opener: urllib.request.OpenerDirector,
+    cookie_header: str,
+    user_agent: str,
+    now: datetime,
+) -> int:
+    slot = slot_of(now)
+    log("今日结果未确认，只核对接积分流水，不提交签到")
+    visible = submission_visible(opener, cookie_header, user_agent, now)
+    if visible == "already":
+        log("积分流水确认今日已签到")
+        log_event(
+            "ALREADY_CHECKED_IN",
+            slot=slot,
+            index="na",
+            channel="none",
+            retry=0,
+            result="already",
+            lock_written=True,
+        )
+        return finish(0, lock=True, now=now)
+    log("仍无法确认今日签到结果，停止当天自动提交")
+    log_event(
+        "OUTCOME_UNKNOWN",
+        slot=slot,
+        index="na",
+        channel="none",
+        retry=0,
+        result="unknown",
+        lock_written=False,
+    )
+    return finish(2, lock=False, now=now)
+
+
+def run_readonly(
+    opener: urllib.request.OpenerDirector,
+    cookie_header: str,
+    user_agent: str,
+    now: datetime,
+) -> int:
+    log("只读诊断，不提交签到，不启动浏览器")
+    code = 0
+    try:
+        _host, _status, points = api_with_domains(
+            opener, "GET", "/api/user/points", cookie_header, None, user_agent
+        )
+        if already_checked_in_today(points, now):
+            log("只读诊断：积分流水显示今日已有签到记录")
+        else:
+            log("只读诊断：积分流水未显示今日签到")
+    except ApiError as exc:
+        log(f"只读诊断失败 reason={exc.reason}")
+        code = 1 if not exc.retryable else 2
+    except Exception:
+        log("只读诊断失败")
+        code = 2
+    if code == 0:
+        try:
+            host, iqi = get_iqi(opener, cookie_header, user_agent)
+            log(
+                f"IQI host={host} score={iqi['score']:g} level={iqi['level']} "
+                f"bandwidth={iqi['bandwidth']} latency={iqi['latency']}"
+            )
+        except Exception:
+            log("只读诊断未能读取 Index")
+        try:
+            _host, _status, status_payload = api_with_domains(
+                opener, "GET", "/api/user/status", cookie_header, None, user_agent
+            )
+            log(f"status {summarize_status(status_payload)}")
+        except Exception:
+            log("只读诊断未能读取 status")
+    return finish(code, lock=False, now=now)
+
+
+def _run_locked(now: datetime) -> int:
     if local_day_locked(now) and not force_requested():
         log(f"今日 {day_key(now)} 已有本地成功标记，跳过 GLaDOS API")
+        log_event(
+            "DAY_LOCKED",
+            slot=slot_of(now),
+            index="na",
+            channel="none",
+            retry=0,
+            result="skip",
+            lock_written=True,
+        )
         return finish(0, lock=True, now=now)
     try:
         ck, kind = load_cookie()
@@ -775,6 +1351,10 @@ def run(now: datetime | None = None) -> int:
     log(f"运行检查 北京时间={now:%H:%M} proxy={proxy or 'direct'} ua={describe_user_agent()}")
     if kind == "koa":
         log("Cookie 为旧版 koa:sess 对。2026 接口可能拒绝，建议改用 gld:sess 与 gld:sess.sig。")
+    if readonly_requested():
+        return run_readonly(opener, ck, user_agent, now)
+    if unknown_locked(now):
+        return reconcile_unknown(opener, ck, user_agent, now)
 
     threshold = get_iqi_threshold(now)
     if threshold is None:
@@ -799,6 +1379,15 @@ def run(now: datetime | None = None) -> int:
     if points_payload is not None and already_checked_in_today(points_payload, now):
         log_reward(today_positive_change(points_payload, now), None, already=True)
         log("今日已签到，退出")
+        log_event(
+            "ALREADY_CHECKED_IN",
+            slot=slot_of(now),
+            index="na",
+            channel="none",
+            retry=0,
+            result="already",
+            lock_written=True,
+        )
         return finish(0, lock=True, now=now)
     if points_payload is None and threshold != "ANY":
         log("查询今日签到状态失败")
@@ -835,14 +1424,61 @@ def run(now: datetime | None = None) -> int:
                 f"Index {score:g} >= {threshold}（严格小于才签），"
                 f"本次不签，等下一档计划任务"
             )
+            log_event(
+                "INDEX_SKIP",
+                slot=slot_of(now),
+                index=index_text(score),
+                channel="none",
+                retry=0,
+                result="skip",
+                lock_written=False,
+            )
             return finish(0, lock=False, now=now)
         log(f"Index {score:g} < {threshold}（{schedule_label(threshold)}），执行签到")
     elif score is None:
         log(f"{schedule_label(threshold)}，IQI 不可用，执行兜底签到")
     else:
         log(f"Index {score:g}，{schedule_label(threshold)}，执行签到")
-    code = do_checkin(opener, ck, user_agent, now)
+    code = submit_with_policy(opener, ck, user_agent, now, score)
     return finish(code, lock=code == 0, now=now)
+
+
+def run(now: datetime | None = None) -> int:
+    load_dotenv()
+    now = now or beijing_now()
+    if not acquire_process_lock():
+        log("已有签到进程正在运行，本次退出")
+        log_event(
+            "DAY_LOCKED",
+            slot=slot_of(now),
+            index="na",
+            channel="none",
+            retry=0,
+            result="busy",
+            lock_written=False,
+        )
+        emit_day_lock(False)
+        return 0
+    try:
+        return _run_locked(now)
+    finally:
+        release_process_lock()
+
+
+def init_browser_session() -> int:
+    load_dotenv()
+    if not acquire_process_lock():
+        log("已有签到进程正在运行，未打开浏览器")
+        return 1
+    try:
+        from browser_checkin import init_browser
+
+        return init_browser(domain_list()[0], log)
+    except Exception:
+        log("浏览器初始化失败")
+        return 1
+    finally:
+        release_process_lock()
 
 
 def _test_thresholds() -> None:
@@ -866,6 +1502,8 @@ def _test_thresholds() -> None:
 
 def main() -> int:
     try:
+        if "--init-browser" in sys.argv:
+            return init_browser_session()
         return run()
     except Exception:
         log("异常: 未预期错误")

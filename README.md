@@ -2,13 +2,16 @@
 
 按 2026 年官网控制台的一次性签到协议：先 `GET /api/user/checkin/challenge`，等待至少 **2.7 秒**，再在**签发该验证的同一域名**提交 `POST /api/user/checkin`。请求体是 `{"token":"<host>","nonce":"<nonce>","proof":"<sha256>"}`，其中 `proof = SHA-256(nonce + ".glados-observe-v1")`。TTL 盖不住这次等待、或等待后已经到期的验证不会提交。失败重试会重新取 challenge，不会拿旧 nonce 去打另一个域名，也不会退回只提交 token 的旧请求。
 
-协议依据 [lankerr/2026-glados-checkin](https://github.com/lankerr/2026-glados-checkin) 的 PR #31、#33，以及 issue #28 中 chengchang1987-cloud 提供的 challenge 证据。本仓库只吸收这条签到链路，仍用标准库 `urllib`，不引入自动兑换或推送。
+若接口返回 HTTP 200 且 `code=5, reason=turnstile`，说明 Cloudflare Turnstile 未通过，这次 API 签到没有成功。脚本会停止重复调用纯 API，改由本机已安装的 Chrome 或 Edge 打开官方签到页。验证和签到请求仍由官方页面自己完成；脚本不计算 Turnstile token，也不用无头 Chromium 代替。
 
-- **零依赖**：只用 Python 标准库（`urllib`），无需 `pip install`
+协议依据 [lankerr/2026-glados-checkin](https://github.com/lankerr/2026-glados-checkin) 的 PR #31、#33，以及 issue #28 中 chengchang1987-cloud 提供的 challenge 证据。浏览器通道只参考其会话隔离、身份核验和单次提交方式，不复制未合并的草稿实现。本仓库不引入自动兑换或推送。
+
+- **API 路径**：只用 Python 标准库（`urllib`）
+- **浏览器路径**：需要 `playwright`，并使用本机 Chrome 或 Edge
 - **IQI 四档签到**：00:01 首次 `<90` 争取 +9 / 00:31 补签 `<95` 接受 +7 / 01:01 补签 `<100` 接受 +5 / 01:31 无条件兜底
 - **01:31 兜底**：这一档即使 IQI 查询失败也会签到。认证被拒绝时停止，不会换成别的域名硬签
 - **多域名**：challenge 可以换域名重新获取；真正的签到 POST 只打签发域名
-- **两种部署**：Windows 计划任务，或 GitHub Actions
+- **两种部署**：Windows 计划任务负责签到；GitHub Actions 只做手动只读诊断
 
 认证接受完整的 `gld:sess` + `gld:sess.sig`，也接受旧的 `koa:sess` + `koa:sess.sig`。旧对仍会尝试，但 2026 接口可能直接拒绝。**Cookie 和 User-Agent 只放 `.env` 或 GitHub Actions Secrets，绝不提交进仓库，日志也不打印这些值。**
 
@@ -24,10 +27,13 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `checkin.py` | 主脚本，零依赖 |
-| `tests/test_checkin_v02.py` | Mock API 单测 |
+| `checkin.py` | 主脚本：Index 判断、API 签到、浏览器兜底 |
+| `browser_checkin.py` | 本机 Chrome/Edge 官方页面签到 |
+| `tests/test_checkin_v02.py` | 原有 Mock API 单测 |
+| `tests/test_browser_checkin.py` | Turnstile、浏览器和锁的 Mock 单测 |
+| `requirements.txt` | 浏览器通道依赖 `playwright` |
 | `install-task.ps1` | 注册 Windows 计划任务 |
-| `.github/workflows/checkin.yml` | GitHub Actions 定时任务 |
+| `.github/workflows/checkin.yml` | GitHub Actions 手动只读诊断 |
 | `.env.example` | 环境变量模板 |
 | `checkin.log` | 运行日志（已 gitignore） |
 
@@ -100,7 +106,7 @@
 
 示例：Index 全天 92 → 00:01 不签（≥90）→ 00:31 签（<95）。若前三档都未签，01:31 仍会签到以免断签。
 
-签到请求失败时会重新获取 challenge，不会复用旧 nonce。`401` / `403`、`code=-2`、无权限或自动签到拒绝会立即停止。
+签到请求失败时会重新获取 challenge，不会复用旧 nonce。`401` / `403`、`code=-2`、无权限或自动签到拒绝会立即停止。`code=5, reason=turnstile` 不会继续重试纯 API，而是打开本机浏览器。请求超时后先查积分流水：流水确认未签到才允许重试；流水也失败则记为未知结果，当天不再提交。
 
 签到后读取 Points History 核对今日入账。低奖励只记一条异常日志，**不再次签到**。流水还没证明奖励数额，不能据此认为积分已经恢复。
 
@@ -154,7 +160,10 @@ py -3 -m unittest discover -s tests -v
 
 - `code=0`：签到成功
 - `code=1`：今天已经签过
+- `code=5` 且 `reason=turnstile`：API 被 Turnstile 拒绝，改走本机浏览器
 - 其他：失败（常见是 Cookie 过期）
+
+结果还会分成四种状态。`SUCCESS` 和 `ALREADY_CHECKED_IN` 写入当天成功锁。明确没有提交成功的 `FAILED` 才按每档最多 3 次重试。`UNKNOWN` 表示请求可能已经发出但结果无法确认：脚本只核对接积分流水，不再提交；流水后来确认已签到时，会升级为成功锁。
 
 ### Windows 每天自动跑
 
@@ -162,9 +171,22 @@ py -3 -m unittest discover -s tests -v
 powershell -ExecutionPolicy Bypass -File .\install-task.ps1
 ```
 
-默认定时 **00:01 / 00:31 / 01:01 / 01:31** 四档；已开启 **唤醒计算机以运行此任务**。日志见 `checkin.log`。
+默认定时 **00:01 / 00:31 / 01:01 / 01:31** 四档；已开启 **唤醒计算机以运行此任务**。任务运行在当前用户的交互会话里，到点直接执行 `py -3 checkin.py`。日志见 `checkin.log`。
 
-某一档签到成功，或 Points History 确认今天已经签过，脚本会在本目录写下 `.glados-checkin-lock/glados-checkin-success-当天日期`。同一天后面的计划任务仍会启动，但在读取 Cookie 和请求 GLaDOS 之前就退出。Index 不达标不写这个文件。第二天文件名对不上，四档自动恢复。要忽略标记再跑一次：`py -3 checkin.py --force`。
+浏览器签到需要本机已安装 Google Chrome 或 Microsoft Edge，并且 Windows 用户已经登录到桌面。锁屏或未登录时浏览器可能打不开；这种情况会记失败，不会当成签到成功。
+
+首次使用浏览器通道：
+
+```powershell
+py -3 -m pip install -r requirements.txt
+py -3 checkin.py --init-browser
+```
+
+`--init-browser` 会打开独立的浏览器 Profile，路径在 `%LOCALAPPDATA%\glados-checkin\browser-profile`。在窗口里登录 GLaDOS，然后回到终端按 Enter。这一步不点击签到。不要使用日常 Chrome 配置，以免和正在打开的浏览器抢同一个 Profile。
+
+成功锁、未知结果锁和进程锁放在 `%LOCALAPPDATA%\glados-checkin\state\`。某一档签到成功，或积分流水确认今天已经签过，会写入当天成功锁。同一天后面的计划任务仍会启动，但在读取 Cookie 和请求 GLaDOS 之前就退出。Index 不达标不写这个文件。结果未知时写入另一份当天锁，后续时段只查询流水，不再提交。第二天文件名对不上，四档自动恢复。要忽略成功标记再跑一次：`py -3 checkin.py --force`。`--force` 不会清除未知结果锁。
+
+同一时刻只会有一个签到进程进入流程。浏览器崩溃或机器重启后，若进程已经不在，可以继续；成功锁和未知结果锁仍按北京时间自然日保留。
 
 注意：仅对**睡眠**有效，关机/休眠后无法唤醒；部分笔记本需在 BIOS 或电源选项里允许「定时器唤醒」。
 
@@ -180,9 +202,7 @@ Unregister-ScheduledTask -TaskName GLaDOS-Checkin -Confirm:$false
 
 `Settings → Secrets and variables → Actions`
 
-不要把 `.env` 或 `checkin.log` 推上去。cron 为北京时间 **00:01 / 00:31 / 01:01 / 01:31**。某一档签到成功，或 Points History 确认今天已经签过，Actions 会按北京时间写入当日成功标记；同一天后面的定时任务仍会留下一条运行记录，但不再启动 Python，也不再请求 GLaDOS。Index 不达标不会写标记，下一档继续。第二天日期变化后标记自动失效。
-
-手动运行时可勾选 `force`，忽略当日标记再核验一次。可选 User-Agent 放在 Actions Variables 或 Secrets 的 `GLADOS_USER_AGENT`。GitHub 可能延迟，本机计划任务更稳。
+不要把 `.env` 或 `checkin.log` 推上去。Actions 不再定时签到，避免和本机计划任务同时提交。手动运行 `workflow_dispatch` 时以 `GLADOS_READONLY=1` 查询 Index、积分和状态，不提交签到，也不启动浏览器。可选 User-Agent 放在 Actions Variables 或 Secrets 的 `GLADOS_USER_AGENT`。
 
 ---
 

@@ -26,11 +26,13 @@ Register-ScheduledTask `
     -Trigger $triggers `
     -Settings $settings `
     -Principal $principal `
-    -Description "GLaDOS 4-tier check-in 00:01-01:31" `
+    -Description "GLaDOS 4-tier check-in 00:01-01:31. Interactive session; may open Chrome or Edge." `
     -Force | Out-Null
 
 Write-Host "Registered scheduled task $taskName with $($times.Count) daily triggers."
 Write-Host "  00:01 Index<90 | 00:31 Index<95 | 01:01 Index<100 | 01:31 unconditional"
 Write-Host "  Wake: enabled"
+Write-Host "  Session: interactive logon of $env:USERNAME. The desktop must be signed in."
+Write-Host "  Browser profile: $env:LOCALAPPDATA\glados-checkin\browser-profile"
 Write-Host "Run now: Start-ScheduledTask -TaskName $taskName"
 Write-Host "Log file: $dir\checkin.log"
